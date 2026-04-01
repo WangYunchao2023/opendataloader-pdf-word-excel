@@ -455,14 +455,17 @@ def extract_excel_to_json(xlsx_path: str) -> dict:
 
         elements.append({
             "type": "table",
-            "sheet": sheet_name,
+            "location": {
+                "excel": sheet_name,           # 主要标识：原Excel Sheet名
+                "pdf_page": None,               # PDF页码（匹配到则填入，否则None）
+            },
             "table_index": table_count + 1,
             "content": table_content,
             "content_preview": table_content[:100],
             "row_count": len(data_rows),
             "col_count": len(headers),
             "headers": headers,
-            "data_rows": serializable_rows,  # 结构化数组，AI 可直接分析
+            "data_rows": serializable_rows,     # 结构化数组，AI 可直接分析
             "section_path": f"Excel > {Path(xlsx_path).stem} > {sheet_name}",
         })
         table_count += 1
@@ -490,7 +493,10 @@ def extract_excel_to_json(xlsx_path: str) -> dict:
 
                 elements.append({
                     "type": "chart",
-                    "sheet": sheet_name,
+                    "location": {
+                        "excel": sheet_name,           # 主要标识：原Excel Sheet名
+                        "pdf_page": None,               # PDF页码（匹配到则填入，否则None）
+                    },
                     "chart_index": chart_count,
                     "chart_type": chart_type,
                     "chart_title": str(chart_title),
@@ -1082,17 +1088,22 @@ def run_convert(pdf_path: str, output_dir: str,
 
                 pdf_json_path.unlink(missing_ok=True)
 
-            # 为每个元素附加 sheet 页码（未匹配到则留空，人工核对）
+            # 为每个元素写入 PDF 页码（写入 location["pdf_page"]）
+            matched_sheets = {}
             for elem in excel_data.get("elements", []):
-                sh = elem.get("sheet", "")
+                sh = elem.get("location", {}).get("excel", "") if isinstance(elem.get("location"), dict) else elem.get("sheet", "")
                 if sh in pdf_page_by_sheet and pdf_page_by_sheet[sh]:
-                    elem["page"] = pdf_page_by_sheet[sh]
+                    elem.setdefault("location", {})["pdf_page"] = pdf_page_by_sheet[sh]
+                    matched_sheets[sh] = pdf_page_by_sheet[sh]
                 else:
-                    elem["page"] = None  # 未匹配，人工核对
+                    elem.setdefault("location", {})["pdf_page"] = None
 
-            # 在 excel_data 顶层记录 sheet→page 映射
-            excel_data["sheet_page_map"] = dict(pdf_page_by_sheet)
+            # 更新 excel_data 元数据
+            excel_data["source"] = "openpyxl" + ("+pdf-position" if matched_sheets else "")
+            excel_data["sheet_page_map"] = dict(matched_sheets)
             excel_data["pdf_total_pages"] = pdf_page_count
+            excel_data["pdf_page_matched"] = len(matched_sheets)
+            excel_data["pdf_page_unmatched"] = len(sheets) - len(matched_sheets)
 
             # 输出 sheet→页码映射供核对（仅显示已匹配到的）
             matched_sheets = {sh: pg for sh, pg in pdf_page_by_sheet.items() if pg}
