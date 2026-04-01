@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-文档自动检测与转换脚本（统一处理 PDF / Word）
-版本: 1.5.0
+文档自动检测与转换脚本（统一处理 PDF / Word / Excel）
+版本: 1.6.0
 日期: 2026-04-01
 
-架构说明（v1.5）：
+架构说明（v1.6）：
   输入为 PDF  → 直接提取（位置信息 + 内容，PDF 限制：有 bbox/页码，表格数据可能稀疏）
   输入为 Word → Word转PDF + docx直接提取 + PDF位置提取 → 智能合并
                相同信息以更可靠来源为准：表格/文本内容以 docx 为准，位置信息（页码/bbox）以 PDF 为准
+  输入为 Excel → openpyxl直接提取（结构化数据/表格/图表）+ Excel转PDF获取页码 → 合并
 
 输出：统一的两文件架构
   ✦ {basename}.json    ← 结构化数据，含完整内容和位置信息
@@ -380,7 +381,179 @@ def convert_word_to_markdown(docx_path: str) -> str:
                 lines.append(row)
 
     return "\n".join(lines)
-def extract_word_to_json(docx_path: str) -> dict:
+
+
+# ---------- Excel 提取 ----------
+def _make_serializable(val):
+    """将 Excel 单元格值转为 JSON 可序列化类型"""
+    import datetime
+    if val is None:
+        return ""
+    if isinstance(val, (datetime.datetime, datetime.date, datetime.time)):
+        return val.isoformat()
+    if isinstance(val, float):
+        # 截断浮点数精度
+        return round(val, 6)
+    return val
+
+
+def extract_excel_to_json(xlsx_path: str) -> dict:
+    """
+    用 openpyxl 提取 Excel 完整内容：
+    - 工作表列表 + 表头
+    - 每个 sheet 的数据区域（转为 table 结构）
+    - 命名区域 / 表格对象
+    - chart 图表（提取图表类型 + 关联数据表）
+    输出格式与 PDF/Word 统一（elements 数组）。
+    """
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+    from openpyxl.chart import BarChart, LineChart, PieChart, ScatterChart, Reference
+
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    elements = []
+    sheet_count = 0
+    table_count = 0
+    chart_count = 0
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        sheet_count += 1
+
+        # 跳过空 sheet
+        if ws.max_row < 2 or ws.max_column < 2:
+            continue
+
+        # 判断 sheet 是否为表格（是否有数据的起始行）
+        # 收集该 sheet 的所有非空单元格数据
+        data_rows = []
+        for row in ws.iter_rows(values_only=True):
+            if any(cell is not None for cell in row):
+                data_rows.append(list(row))
+
+        if not data_rows:
+            continue
+
+        # 检测表头（第一行是否可作为列名）
+        headers = [_make_serializable(c) for c in data_rows[0]]
+
+        # 构建 Markdown 表格
+        md_rows = []
+        md_rows.append("| " + " | ".join(str(h) for h in headers) + " |")
+        md_rows.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for row in data_rows[1:]:
+            row_vals = [_make_serializable(c) for c in row]
+            row_str = " | ".join(str(v) for v in row_vals)
+            md_rows.append("| " + row_str + " |")
+
+        table_content = "\n".join(md_rows)
+
+        # 可序列化的 data_rows
+        serializable_rows = [
+            [_make_serializable(c) for c in row] for row in data_rows
+        ]
+
+        elements.append({
+            "type": "table",
+            "sheet": sheet_name,
+            "table_index": table_count + 1,
+            "content": table_content,
+            "content_preview": table_content[:100],
+            "row_count": len(data_rows),
+            "col_count": len(headers),
+            "headers": headers,
+            "data_rows": serializable_rows,  # 结构化数组，AI 可直接分析
+            "section_path": f"Excel > {Path(xlsx_path).stem} > {sheet_name}",
+        })
+        table_count += 1
+
+        # 提取 chart 信息
+        if hasattr(ws, "_charts"):
+            for chart in ws._charts:
+                chart_count += 1
+                chart_type = type(chart).__name__
+                chart_title = chart.title if hasattr(chart, "title") and chart.title else ""
+
+                # 提取图表关联的数据范围
+                data_desc = ""
+                if hasattr(chart, "data"):
+                    refs = chart.data
+                    if refs:
+                        data_desc = f"数据范围: {refs}"
+
+                # 构建图表的摘要数据（将图表还原为简化的数据表）
+                sample_data = []
+                if hasattr(chart, "series") and chart.series:
+                    for series in chart.series:
+                        sname = series.title if hasattr(series, "title") and series.title else f"系列{chart_count}"
+                        sample_data.append(f"系列: {sname}")
+
+                elements.append({
+                    "type": "chart",
+                    "sheet": sheet_name,
+                    "chart_index": chart_count,
+                    "chart_type": chart_type,
+                    "chart_title": str(chart_title),
+                    "content": f"[{chart_type}] {chart_title} | {data_desc}",
+                    "content_preview": f"{chart_type}: {chart_title}",
+                    "section_path": f"Excel > {Path(xlsx_path).stem} > {sheet_name} > 图表",
+                })
+
+    # 命名区域
+    defined_names = []
+    if wb.defined_names:
+        for name, defn in wb.defined_names.items():
+            defined_names.append({
+                "name": name,
+                "value": _make_serializable(getattr(defn, "value", "")),
+                "attr_text": str(getattr(defn, "attr_text", "")),
+            })
+
+    return {
+        "doc_type": "excel",
+        "source": "openpyxl",
+        "total_sheets": sheet_count,
+        "total_tables": table_count,
+        "total_charts": chart_count,
+        "defined_names": defined_names,
+        "sheets": wb.sheetnames,
+        "elements": elements,
+    }
+
+
+def extract_excel_to_markdown(xlsx_path: str) -> str:
+    """生成 Excel 的可读 Markdown（每个 sheet 转为 Markdown 表格）"""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    lines = [f"# {Path(xlsx_path).stem}\n"]
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        lines.append(f"\n## Sheet: {sheet_name}\n")
+
+        data_rows = []
+        for row in ws.iter_rows(values_only=True):
+            if any(cell is not None for cell in row):
+                data_rows.append(list(row))
+
+        if not data_rows:
+            lines.append("_（空表）_\n")
+            continue
+
+        headers = [_make_serializable(c) for c in data_rows[0]]
+        lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for row in data_rows[1:]:
+            row_vals = [_make_serializable(c) for c in row]
+            row_str = " | ".join(str(v) for v in row_vals)
+            lines.append("| " + row_str + " |")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------- Word 提取 ----------
     """用 python-docx 提取 Word 内容，输出与 PDF 相同的 JSON 结构"""
     from docx import Document
 
@@ -813,6 +986,98 @@ def run_convert(pdf_path: str, output_dir: str,
         "returncode": None,
     }
 
+    # ---- Excel 文档：openpyxl直接提取 + PDF位置辅助 ----
+    ext_lower = pdf_path.lower()
+    if ext_lower.endswith(".xlsx") or ext_lower.endswith(".xls"):
+        print(f"[INFO] 检测到 Excel 文档 → openpyxl 提取 + PDF位置辅助")
+        original_basename = Path(pdf_path).stem
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            # Step 1: openpyxl 提取（结构化数据 + 表格 + 图表）
+            print(f"[Step 1/3] Excel 数据提取...")
+            excel_data = extract_excel_to_json(pdf_path)
+
+            # Step 2: Excel → PDF（用于页码位置）
+            print(f"[Step 2/3] Excel → PDF（用于提取位置信息）...")
+            pdf_converted = convert_word_to_pdf(pdf_path, output_dir="/tmp")
+
+            # Step 3: PDF 位置提取
+            print(f"[Step 3/3] PDF 位置提取...")
+            pdf_json_path = Path("/tmp") / f"{original_basename}.json"
+            env = os.environ.copy()
+            env["JAVA_HOME"] = JAVA_HOME
+            env["PATH"] = JAVA_HOME + "/bin:" + env.get("PATH", "")
+            subprocess.run(
+                [sys.executable, "-m", "opendataloader_pdf",
+                 pdf_converted, "-o", "/tmp", "-f", "json"],
+                capture_output=True, text=True, env=env, timeout=300
+            )
+
+            # 匹配：按 sheet 名称匹配 page
+            pdf_page_by_sheet = {}
+            if pdf_json_path.exists():
+                with open(pdf_json_path, encoding="utf-8") as f:
+                    pdf_data = json.load(f)
+                # 统计每个 page 有哪些文本（用于推断 sheet 对应页）
+                for elem in pdf_data.get("flat_elements", pdf_data.get("elements", [])):
+                    pg = elem.get("page number") or elem.get("page", "?")
+                    txt = elem.get("content", "")[:50]
+                    if txt:
+                        for sh in excel_data.get("sheets", []):
+                            if sh[:20] in txt:
+                                if sh not in pdf_page_by_sheet:
+                                    pdf_page_by_sheet[sh] = pg
+                pdf_json_path.unlink(missing_ok=True)
+
+            # 为每个元素附加 sheet 页码
+            for elem in excel_data.get("elements", []):
+                sh = elem.get("sheet", "")
+                if sh in pdf_page_by_sheet:
+                    elem["page"] = pdf_page_by_sheet[sh]
+                else:
+                    elem["page"] = 1
+
+            # 保存 JSON
+            json_path = Path(output_dir) / f"{original_basename}.json"
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(excel_data, f, ensure_ascii=False, indent=2)
+
+            # 生成 Markdown
+            md_content = extract_excel_to_markdown(pdf_path)
+            md_path = Path(output_dir) / f"{original_basename}.md"
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(md_content)
+
+            # 清理临时 PDF
+            Path(pdf_converted).unlink(missing_ok=True)
+
+            print(f"[成功] Excel 提取完成！")
+            print(f"[INFO] 生成文件:")
+            print(f"  JSON: {json_path}")
+            print(f"  MD:   {md_path}")
+            print(f"[INFO] 包含: {excel_data['total_sheets']} 个Sheet | "
+                  f"{excel_data['total_tables']} 张表格 | "
+                  f"{excel_data['total_charts']} 个图表")
+
+            return {
+                "success": True,
+                "output_dir": output_dir,
+                "mode_used": "excel-openpyxl",
+                "files_created": [str(json_path), str(md_path)],
+                "excel_stats": {
+                    "sheets": excel_data["total_sheets"],
+                    "tables": excel_data["total_tables"],
+                    "charts": excel_data["total_charts"],
+                }
+            }
+
+        except Exception as e:
+            print(f"[错误] Excel 提取失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "mode_used": "excel-failed", "error": str(e)}
+
     # ---- Word 文档：docx内容 + PDF位置 → 合并 ----
     ext_lower = pdf_path.lower()
     if ext_lower.endswith(".docx") or ext_lower.endswith(".doc"):
@@ -1052,8 +1317,11 @@ def main():
 
     # 处理 detect-only
     if args.detect_only:
-        if args.input.lower().endswith(".docx") or args.input.lower().endswith(".doc"):
+        ext = args.input.lower()
+        if ext.endswith(".docx") or ext.endswith(".doc"):
             info = {"type": "word", "format": "docx/doc"}
+        elif ext.endswith(".xlsx") or ext.endswith(".xls"):
+            info = {"type": "excel", "format": "xlsx/xls"}
         else:
             info = detect_pdf_type(args.input)
         print(json.dumps(info, ensure_ascii=False, indent=2))
