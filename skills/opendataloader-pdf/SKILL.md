@@ -1,6 +1,6 @@
 ---
 name: opendataloader-pdf
-version: 1.6.0
+version: 1.7.0
 version_date: 2026-04-01
 description: 文档解析工具（统一处理 PDF / Word / Excel），自动检测文档类型、智能选择模式（Fast/Hybrid）。Word 输入时采用「docx内容 + PDF位置」双来源合并；Excel 输入时采用「openpyxl结构化数据 + PDF页码」合并。统一输出 JSON（含完整数据、headers、data_rows 数组）和 Markdown，方便 AI 读取、分析、汇总与自动撰写。
 ---

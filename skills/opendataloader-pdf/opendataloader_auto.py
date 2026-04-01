@@ -521,16 +521,19 @@ def extract_excel_to_json(xlsx_path: str) -> dict:
     }
 
 
-def extract_excel_to_markdown(xlsx_path: str) -> str:
+def extract_excel_to_markdown(xlsx_path: str, page_hints: dict = None) -> str:
     """生成 Excel 的可读 Markdown（每个 sheet 转为 Markdown 表格）"""
     import openpyxl
 
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    page_hints = page_hints or {}
     lines = [f"# {Path(xlsx_path).stem}\n"]
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        lines.append(f"\n## Sheet: {sheet_name}\n")
+        page_hint = page_hints.get(sheet_name, "")
+        pg_note = f" _(PDF 第{page_hint}页)_" if page_hint else ""
+        lines.append(f"\n## Sheet: {sheet_name}{pg_note}\n")
 
         data_rows = []
         for row in ws.iter_rows(values_only=True):
@@ -1014,29 +1017,95 @@ def run_convert(pdf_path: str, output_dir: str,
                 capture_output=True, text=True, env=env, timeout=300
             )
 
-            # 匹配：按 sheet 名称匹配 page
+            # 匹配：按 sheet 名称匹配 page（改进版）
             pdf_page_by_sheet = {}
+            pdf_page_count = 0
+
             if pdf_json_path.exists():
                 with open(pdf_json_path, encoding="utf-8") as f:
                     pdf_data = json.load(f)
-                # 统计每个 page 有哪些文本（用于推断 sheet 对应页）
-                for elem in pdf_data.get("flat_elements", pdf_data.get("elements", [])):
+
+                pdf_page_count = pdf_data.get("number of pages", 0)
+
+                # 策略1：收集每页的全部文本
+                page_texts = {}  # page_num -> all_text
+                for elem in pdf_data.get("flat_elements", []):
                     pg = elem.get("page number") or elem.get("page", "?")
-                    txt = elem.get("content", "")[:50]
-                    if txt:
-                        for sh in excel_data.get("sheets", []):
-                            if sh[:20] in txt:
-                                if sh not in pdf_page_by_sheet:
-                                    pdf_page_by_sheet[sh] = pg
+                    txt = elem.get("content", "") or ""
+                    if pg not in page_texts:
+                        page_texts[pg] = ""
+                    page_texts[pg] += " " + txt
+
+                # 策略2：建立每页的标题词集合（用于模糊匹配）
+                page_headings = {}  # page_num -> set of heading words
+                for elem in pdf_data.get("flat_elements", []):
+                    if elem.get("type") == "heading":
+                        pg = elem.get("page number") or elem.get("page", "?")
+                        if pg not in page_headings:
+                            page_headings[pg] = set()
+                        heading_text = elem.get("content", "") or ""
+                        # 拆词
+                        for w in re.findall(r"[\w\W]{2,}", heading_text):
+                            page_headings[pg].add(w)
+
+                # 为每个 sheet 匹配最可能的 page
+                sheets = excel_data.get("sheets", [])
+
+                for sh in sheets:
+                    sh_normalized = sh.strip()
+
+                    # 精确匹配：sheet 名出现在某页
+                    matched = False
+                    for pg, full_text in page_texts.items():
+                        if sh_normalized and sh_normalized[:15] in full_text:
+                            pdf_page_by_sheet[sh] = pg
+                            matched = True
+                            break
+
+                    # 模糊匹配：共享词汇多的页面
+                    if not matched:
+                        sh_words = set(re.findall(r"[\w\W]{2,}", sh_normalized))
+                        best_pg, best_score = None, 0
+                        for pg, heading_words in page_headings.items():
+                            if heading_words and sh_words:
+                                score = len(sh_words & heading_words) / len(sh_words | heading_words)
+                                if score > best_score and score > 0.1:
+                                    best_score = score
+                                    best_pg = pg
+                        if best_pg:
+                            pdf_page_by_sheet[sh] = best_pg
+                            matched = True
+
+                    # 未匹配到：不记录（页码留空，人工核对）
+                    if not matched:
+                        pdf_page_by_sheet[sh] = None
+
                 pdf_json_path.unlink(missing_ok=True)
 
-            # 为每个元素附加 sheet 页码
+            # 为每个元素附加 sheet 页码（未匹配到则留空，人工核对）
             for elem in excel_data.get("elements", []):
                 sh = elem.get("sheet", "")
-                if sh in pdf_page_by_sheet:
+                if sh in pdf_page_by_sheet and pdf_page_by_sheet[sh]:
                     elem["page"] = pdf_page_by_sheet[sh]
                 else:
-                    elem["page"] = 1
+                    elem["page"] = None  # 未匹配，人工核对
+
+            # 在 excel_data 顶层记录 sheet→page 映射
+            excel_data["sheet_page_map"] = dict(pdf_page_by_sheet)
+            excel_data["pdf_total_pages"] = pdf_page_count
+
+            # 输出 sheet→页码映射供核对（仅显示已匹配到的）
+            matched_sheets = {sh: pg for sh, pg in pdf_page_by_sheet.items() if pg}
+            if matched_sheets:
+                print(f"[INFO] Sheet → PDF页码 映射（共 {pdf_page_count} 页，已匹配 {len(matched_sheets)}/{len(sheets)} 个Sheet）:")
+                for sh, pg in matched_sheets.items():
+                    print(f"       Sheet「{sh}」→ PDF第 {pg} 页")
+            if len(matched_sheets) < len(sheets):
+                unmatched = [sh for sh in sheets if sh not in matched_sheets]
+                print(f"[INFO] 以下 Sheet 未匹配到页码（PDF中未出现Sheet名，请人工核对）:")
+                for sh in unmatched:
+                    print(f"       Sheet「{sh}」→ 需人工确认页码")
+
 
             # 保存 JSON
             json_path = Path(output_dir) / f"{original_basename}.json"
@@ -1044,7 +1113,7 @@ def run_convert(pdf_path: str, output_dir: str,
                 json.dump(excel_data, f, ensure_ascii=False, indent=2)
 
             # 生成 Markdown
-            md_content = extract_excel_to_markdown(pdf_path)
+            md_content = extract_excel_to_markdown(pdf_path, page_hints=pdf_page_by_sheet)
             md_path = Path(output_dir) / f"{original_basename}.md"
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(md_content)
